@@ -1,3 +1,4 @@
+import os
 import sys
 from typing import Dict, List
 
@@ -12,10 +13,15 @@ except Exception as exc:  # pragma: no cover - handled at runtime
 else:
     _HYDRA_IMPORT_ERROR = None
 
+# the directory the command was launched in (Hydra's runtime.cwd is re-read per multirun job)
+_LAUNCH_CWD = os.getcwd()
+
 
 def _append_list_option(argv: List[str], flag: str, values):
     if values is None:
         return
+    if isinstance(values, (str, int, float)):  # `idx: auto` or `idx: 4` rather than a list
+        values = [values]
     argv.append(flag)
     argv.extend([str(v) for v in values])
 
@@ -64,10 +70,30 @@ def build_legacy_argv(cfg: DictConfig) -> List[str]:
 
 
 def _run(cfg: DictConfig):
+    # A mode changes into its output directory; start every job (also each job of a
+    # --multirun sweep, which runs in this process) from the directory the command was
+    # launched in, so relative paths such as shared.dir resolve the same way for every job.
+    os.chdir(_LAUNCH_CWD)
     mode = cfg.mode
     argv = build_legacy_argv(cfg)
+    # In a --multirun sweep the jobs can start within the same second, so the default
+    # outputs/<mode>/<timestamp> folder would be shared; each job writes to its own Hydra job
+    # directory instead (multirun/<date>/<time>/<job number>) unless shared.outdir is set.
+    from hydra.core.hydra_config import HydraConfig
+    from hydra.types import RunMode
+
+    hc = HydraConfig.get()
+    multirun = hc.mode == RunMode.MULTIRUN
+    if multirun and str(cfg.shared.get("outdir", ".")) == ".":
+        argv[argv.index("--outdir") + 1] = str(hc.runtime.output_dir)
     handler = _get_mode_handler(mode)
-    return handler(argv)
+    if not multirun:
+        return handler(argv)
+    try:
+        return handler(argv)
+    finally:
+        # Hydra sets up the next job's directory from the current one
+        os.chdir(_LAUNCH_CWD)
 
 
 if hydra is not None:

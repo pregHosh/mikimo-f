@@ -12,14 +12,7 @@ import numpy as np
 import pandas as pd
 import sklearn as sk
 from joblib import Parallel, delayed
-from navicat_volcanic.dv1 import curate_d, find_1_dv
-from navicat_volcanic.dv2 import find_2_dv
-from navicat_volcanic.helpers import (
-    bround,
-    group_data_points,
-    user_choose_1_dv,
-    user_choose_2_dv,
-)
+from navicat_volcanic.helpers import bround, group_data_points
 from navicat_volcanic.plotting2d import calc_ci, plot_2d, plot_2d_lsfer
 from navicat_volcanic.plotting3d import (
     get_bases,
@@ -29,9 +22,17 @@ from navicat_volcanic.plotting3d import (
 from scipy.interpolate import interp1d
 from tqdm import tqdm
 
-from . import km_k_volcanic
+from . import km_k_volcanic, run_record
 from .console import item, section
-from .helper import call_imputter, preprocess_data_mkm, process_data_mkm
+from .helper import (
+    call_imputter,
+    choose_descriptors,
+    column_masks,
+    curate_profiles,
+    energy_columns,
+    preprocess_data_mkm,
+    process_data_mkm,
+)
 from .kinetic_solver_runner import calc_km
 from .plot_function import (
     plot_2d_combo,
@@ -352,8 +353,11 @@ def evol_mode(
 
     prod_conc_pt = []
     result_solve_ivp_all = []
+    per_profile = []
+    prod_names = [i.replace("*", "") for i in states if "*" in i]
 
     for i, profile in enumerate(tqdm(d, total=len(d), ncols=80)):
+        status, error = "ok", None
         try:
             (
                 initial_conc,
@@ -377,8 +381,16 @@ def evol_mode(
 
             if len(result) != n_target:
                 prod_conc_pt.append(np.array([np.nan] * n_target))
+                status, error = "failed", f"{len(result)} target values for {n_target} targets"
             else:
                 prod_conc_pt.append(result)
+                if not (result_solve_ivp.success and np.all(np.isfinite(result))):
+                    status = "failed"
+                    error = (
+                        f"non-finite target concentrations ({result_solve_ivp.message})"
+                        if not np.all(np.isfinite(result))
+                        else f"solver reported failure ({result_solve_ivp.message})"
+                    )
 
             result_solve_ivp_all.append(result_solve_ivp)
 
@@ -386,10 +398,28 @@ def evol_mode(
             plot_evo(result_solve_ivp, names[i], states_, x_scale, more_species_mkm)
 
         except Exception as e:
-            print(item("MKM failed", f"{names[i]} ({e})"))
-            prod_conc_pt.append(np.array([np.nan] * n_target))
-            result_solve_ivp_all.append("Shiki")
+            if len(prod_conc_pt) == i:
+                prod_conc_pt.append(np.array([np.nan] * n_target))
+                result_solve_ivp_all.append(None)
+            status, error = "failed", repr(e)
+        if status != "ok":
+            print(item("MKM failed", f"{names[i]}: {error}"))
+        per_profile.append(
+            {
+                "id": str(names[i]),
+                "x": None,
+                "target_conc": dict(zip(prod_names, prod_conc_pt[i])),
+                "status": status,
+                "error": error,
+            }
+        )
 
+    run_record.update("vp", per_profile=per_profile)
+    if any(p["status"] != "ok" for p in per_profile):
+        run_record.set_status("partial")
+        run_record.warn(
+            f"MKM failed for {[p['id'] for p in per_profile if p['status'] != 'ok']}"
+        )
     prod_conc_pt = np.array(prod_conc_pt).T
     if verb > 1:
         prod_names = [i.replace("*", "") for i in states if "*" in i]
@@ -458,13 +488,7 @@ def get_srps_1d(
     """
     from navicat_volcanic.plotting2d import get_reg_targets
 
-    dvs, r2s = find_1_dv(d, tags, coeff, regress, verb)
-    if lfesrs_idx:
-        idx = lfesrs_idx[0]
-        if verb > 1:
-            print(f"\n**Manually chose {tags[idx]} as a descriptor variable****\n")
-    else:
-        idx = user_choose_1_dv(dvs, r2s, tags)  # choosing descp
+    idx = choose_descriptors(1, d, tags, coeff, regress, lfesrs_idx, verb=verb)["idx"]
     if lfesr:
         d = plot_2d_lsfer(
             idx,
@@ -560,17 +584,7 @@ def get_srps_2d(
     """
     from navicat_volcanic.plotting3d import bround, get_reg_targets
 
-    dvs, r2s = find_2_dv(d, tags, coeff, regress, verb)
-    if lfesrs_idx:
-        assert len(lfesrs_idx) == 2
-        "Require 2 lfesrs_idx for activity/seclectivity map"
-        idx1, idx2 = lfesrs_idx
-        if verb > 1:
-            print(
-                f"\n**Manually chose {tags[idx1]} and {tags[idx2]} as descriptors**\n"
-            )
-    else:
-        idx1, idx2 = user_choose_2_dv(dvs, r2s, tags)
+    idx1, idx2 = choose_descriptors(2, d, tags, coeff, regress, lfesrs_idx, verb=verb)["idx"]
 
     X1, X2, tag1, tag2, tags, d, d2, coeff = get_reg_targets(
         idx1, idx2, d, tags, coeff, regress, mode="k"
@@ -609,7 +623,7 @@ def get_srps_2d(
         x1max,
         x2max,
         x1min,
-        x2max,
+        x2min,
         tag1,
         tag2,
         tags,
@@ -760,39 +774,28 @@ def main(arguments=None):
 
     names = df[df.columns[0]].values
     cb, ms = group_data_points(0, 2, names)
-    tags = np.array([str(tag) for tag in df.columns[1:]], dtype=object)
     d = np.float32(df.to_numpy()[:, 1:])
 
-    coeff = np.zeros(len(tags), dtype=bool)
-    regress = np.zeros(len(tags), dtype=bool)
-    for i, tag in enumerate(tags):
-        if "TS" in tag.upper():
-            if verb > 0:
-                print(item("Field inference", f"{tag} -> transition state"))
-            coeff[i] = True
-            regress[i] = True
-        elif "DESCRIPTOR" in tag.upper():
-            if verb > 0:
-                print(item("Field inference", f"{tag} -> non-energy descriptor"))
-            start_des = tag.upper().find("DESCRIPTOR")
-            tags[i] = "".join(
-                [i for i in tag[:start_des]] + [i for i in tag[start_des + 10 :]]
-            )
-            coeff[i] = False
-            regress[i] = False
-        elif "PRODUCT" in tag.upper():
-            if verb > 0:
-                print(item("Field inference", f"{tag} -> reaction free energy (ΔG)"))
-            dgr = d[:, i]
-            coeff[i] = False
-            regress[i] = True
-        else:
-            if verb > 0:
-                print(item("Field inference", f"{tag} -> non-TS stationary point"))
-            coeff[i] = False
-            regress[i] = True
+    # Column roles come from the reaction_profile/v1 check (a roles file, else the shared name rule).
+    tags, roles = energy_columns(df.columns[1:], states)
+    coeff, regress = column_masks(roles)
+    if verb > 0:
+        for tag, role in zip(tags, roles):
+            print(item("Field inference", f"{tag} -> {role}"))
 
-    d, cb, ms = curate_d(d, regress, cb, ms, tags, imputer_strat, nstds=3, verb=verb)
+    d, cb, ms, names, rows = curate_profiles(
+        d, regress, cb, ms, tags, names, imputer_strat, nstds=3, verb=verb
+    )
+    run_record.update(
+        "vp",
+        nd=nd,
+        rows={k: rows[k] for k in ("n_in", "n_used", "dropped")},
+        imputer=imputer_strat,
+        imputed_cells=rows["imputed_cells"],
+        descriptor=None,
+        grid_file=None,
+        target_units="% yield" if report_as_yield else "M",
+    )
 
     # %% selecting modes----------------------------------------------------------#
     if nd == 0:
@@ -832,7 +835,7 @@ def main(arguments=None):
         # For some reason, sometimes the volcanic drops the last state
         # Kinda adhoc fix for now
         tags_corr = np.array([str(t) for t in df.columns[1:]], dtype=object)
-        if tags_corr[-1] not in tags and tags_corr[-1].lower().startswith("p"):
+        if tags_corr[-1] not in tags and roles[-1] == "END":
             d_corr = np.float32(df.to_numpy()[:, 1:])
 
             dgs = np.column_stack((dgs, np.full((npoints, 1), d_corr[-1, -1])))
@@ -909,6 +912,15 @@ def main(arguments=None):
                 if x2base == 0:
                     x2base = 0.5
 
+            run_record.update(
+                "vp",
+                grid_file="mkm_descr_phys.h5",
+                axes={"x1": f"{tag} [kcal/mol]", "x2": screen_cond},
+                per_profile=[
+                    {"id": str(names[i]), "x": float(X[i]), "target_conc": None, "status": None, "error": None}
+                    for i in range(len(X))
+                ],
+            )
             with h5py.File("mkm_descr_phys.h5", "w") as f:
                 group = f.create_group("data")
                 # save each numpy array as a dataset in the group
@@ -1147,6 +1159,22 @@ def main(arguments=None):
                     prod_conc_pt[i, :] = res[0]
                     i += 1
 
+            prod_names_pt = [i.replace("*", "") for i in states if "*" in i]
+            per_profile = [
+                {
+                    "id": str(names[i]),
+                    "x": float(X[i]),
+                    "target_conc": dict(zip(prod_names_pt, prod_conc_pt[i])),
+                    "status": "ok" if np.all(np.isfinite(prod_conc_pt[i])) else "failed",
+                    "error": None
+                    if np.all(np.isfinite(prod_conc_pt[i]))
+                    else "MKM gave no finite target concentration (the plotted point is interpolated)",
+                }
+                for i in range(len(d))
+            ]
+            run_record.update("vp", per_profile=per_profile, grid_file="mkm_vp.h5" if verb > 1 else None)
+            if any(pp["status"] != "ok" for pp in per_profile):
+                run_record.set_status("partial")
             # interpolation
             missing_indices = np.isnan(prod_conc_pt[:, 0])
             prod_conc_pt_corr = prod_conc_pt.copy()
@@ -1278,7 +1306,7 @@ def main(arguments=None):
             x1max,
             x2max,
             x1min,
-            x2max,
+            x2min,
             tag1,
             tag2,
             tags,
@@ -1289,7 +1317,7 @@ def main(arguments=None):
             d, tags, coeff, regress, lfesrs_idx, lmargin, rmargin, npoints, verb
         )
         tags_corr = np.array([str(tag) for tag in df.columns[1:]], dtype=object)
-        if len(grids) != len(tags_corr) and tags_corr[-1].lower().startswith("p"):
+        if len(grids) != len(tags_corr) and roles[-1] == "END":
             # print("\n***Forgot the last state******\n")
             d_corr = np.float32(df.to_numpy()[:, 1:])
 
@@ -1350,8 +1378,18 @@ def main(arguments=None):
             py[i] = X2[i]
 
         # Plotting and saving
-        cb = np.array(cb, dtype="S")
-        ms = np.array(ms, dtype="S")
+        # bytes copies for the HDF5 files; the plots need the colour/marker strings
+        cb_h5 = np.array(cb, dtype="S")
+        ms_h5 = np.array(ms, dtype="S")
+        run_record.update(
+            "vp",
+            grid_file="mkm_vp_3d.h5",
+            per_profile=[
+                {"id": str(names[i]), "x": [float(px[i]), float(py[i])], "target_conc": None,
+                 "status": None, "error": None}
+                for i in range(len(px))
+            ],
+        )
         with h5py.File("mkm_vp_3d.h5", "w") as f:
             group = f.create_group("data")
             # save each numpy array as a dataset in the group
@@ -1360,16 +1398,16 @@ def main(arguments=None):
             group.create_dataset("grids", data=grid_d_fill)
             group.create_dataset("px", data=px)
             group.create_dataset("py", data=py)
-            group.create_dataset("cb", data=cb)
-            group.create_dataset("ms", data=ms)
+            group.create_dataset("cb", data=cb_h5)
+            group.create_dataset("ms", data=ms_h5)
             group.create_dataset("tag1", data=[tag1.encode()])
             group.create_dataset("tag2", data=[tag2.encode()])
 
         x1label = f"{tag1} [kcal/mol]"
         x2label = f"{tag2} [kcal/mol]"
         x1base = np.round((x1max - x1min) / 10, 1)
-        if x2base == 0:
-            x2base = 0.5
+        if x1base == 0:
+            x1base = 0.5
         x2base = np.round((x2max - x2min) / 10, 1)
         if x2base == 0:
             x2base = 0.5
@@ -1411,8 +1449,8 @@ def main(arguments=None):
                 group.create_dataset("agrid", data=activity_grid)
                 group.create_dataset("px", data=px)
                 group.create_dataset("py", data=py)
-                group.create_dataset("cb", data=cb)
-                group.create_dataset("ms", data=ms)
+                group.create_dataset("cb", data=cb_h5)
+                group.create_dataset("ms", data=ms_h5)
                 group.create_dataset("tag1", data=[tag1.encode()])
                 group.create_dataset("tag2", data=[tag2.encode()])
                 group.create_dataset("x1label", data=[x1label.encode()])
@@ -1441,8 +1479,8 @@ def main(arguments=None):
                     group.create_dataset("sgrid", data=selectivity_ratio_)
                     group.create_dataset("px", data=px)
                     group.create_dataset("py", data=py)
-                    group.create_dataset("cb", data=cb)
-                    group.create_dataset("ms", data=ms)
+                    group.create_dataset("cb", data=cb_h5)
+                    group.create_dataset("ms", data=ms_h5)
                     group.create_dataset("tag1", data=[tag1.encode()])
                     group.create_dataset("tag2", data=[tag2.encode()])
                     group.create_dataset("x1label", data=[x1label.encode()])
@@ -1484,8 +1522,8 @@ def main(arguments=None):
                     group.create_dataset("dominant_indices", data=dominant_indices)
                     group.create_dataset("px", data=px)
                     group.create_dataset("py", data=py)
-                    group.create_dataset("cb", data=cb)
-                    group.create_dataset("ms", data=ms)
+                    group.create_dataset("cb", data=cb_h5)
+                    group.create_dataset("ms", data=ms_h5)
                     group.create_dataset("tag1", data=[tag1.encode()])
                     group.create_dataset("tag2", data=[tag2.encode()])
                     group.create_dataset("x1label", data=[x1label.encode()])

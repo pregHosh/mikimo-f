@@ -10,6 +10,8 @@ from navicat_mikimo.__main__ import _get_mode_handler
 def _append_list_option(argv: List[str], flag: str, values):
     if values is None:
         return
+    if isinstance(values, (str, int, float)):  # `idx: auto` or `idx: 4` rather than a list
+        values = [values]
     argv.append(flag)
     argv.extend([str(v) for v in values])
 
@@ -32,7 +34,7 @@ def build_legacy_argv_from_dict(cfg: Dict[str, Any]) -> List[str]:
     _append_list_option(argv, "-a", shared.get("addition"))
     argv.extend(["-iq", str(shared.get("int_quality", 1))])
     argv.extend(["-ncore", str(shared.get("ncore", 1))])
-    argv.extend(["-is", str(shared.get("imputer_strat", "knn"))])
+    argv.extend(["-is", str(shared.get("imputer_strat", "none"))])
     argv.extend(["-v", str(shared.get("verb", 2))])
     if shared.get("quiet"):
         argv.append("--quiet")
@@ -70,6 +72,13 @@ def run_config(config_path: str):
     if "mode" not in cfg:
         raise ValueError("Config must include 'mode' with one of: mkm, vp, cond.")
 
+    # a relative input dir is relative to the config file, not to the working directory
+    shared = cfg.get("shared") or {}
+    in_dir = Path(str(shared.get("dir", "."))).expanduser()
+    if not in_dir.is_absolute():
+        shared["dir"] = str((Path(config_path).resolve().parent / in_dir).resolve())
+    cfg["shared"] = shared
+
     mode = cfg["mode"]
     handler = _get_mode_handler(mode)
     argv = build_legacy_argv_from_dict(cfg)
@@ -84,7 +93,8 @@ def main():
     parser.add_argument(
         "--config",
         required=True,
-        help="Path to YAML config containing mode/shared/mode_config.",
+        help="Path to YAML config containing mode/shared/mode_config. A relative shared.dir "
+        "is resolved against the directory of this file.",
     )
     args = parser.parse_args()
     config_path = Path(args.config)

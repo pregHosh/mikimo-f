@@ -31,7 +31,10 @@ setup(
     author="pregabalin_hoshiyomi",
     author_email="thanapat.worakul@epfl.ch",
     url="https://github.com/lcmd-epfl/mikimo",
-    packages=["navicat_mikimo"],
+    # the Hydra configs (navicat_mikimo/conf/**.yaml) are package data, so navicat_mikimo_hydra
+    # also works from a wheel (non-editable install)
+    packages=find_packages(include=["navicat_mikimo", "navicat_mikimo.*"]),
+    package_data={"": ["*.yaml"]},
     classifiers=[
         "Programming Language :: Python :: 3",
         "Operating System :: OS Independent",
@@ -43,10 +46,13 @@ setup(
         "autograd",
         "matplotlib",
         "pandas",
+        "scikit-learn",
+        "joblib",
         "h5py",
         "fire",
-        "navicat_volcanic",
+        "navicat_volcanic>=1.3.3",
         "openpyxl",
+        "PyYAML",
     ],
     extras_require={
         "hydra": ["hydra-core>=1.3,<1.4"],

@@ -1,7 +1,6 @@
 defaults:
   - shared: default
-  - mode_config: mkm
+  - mode: mkm
+  # mode=<mkm|vp|cond> also selects that mode's options (mode_config/<mode>.yaml)
+  - mode_config: ${mode}
   - _self_
-
-mode: mkm
-

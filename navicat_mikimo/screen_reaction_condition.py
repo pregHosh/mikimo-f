@@ -13,6 +13,7 @@ from navicat_volcanic.helpers import bround
 from scipy.integrate import solve_ivp
 from tqdm import tqdm
 
+from . import run_record
 from .console import item, section
 from .helper import call_imputter, preprocess_data_mkm, process_data_mkm
 from .kinetic_solver import calc_k, system_KE_DE
@@ -94,8 +95,9 @@ def run_mkm_3d(
     assert k_forward_all.shape[0] == rxn_network_all.shape[0]
     assert k_reverse_all.shape[0] == rxn_network_all.shape[0]
     
+    # the compiled solver takes a plain list and reads the species names only
     dydt = system_KE_DE(
-        k_forward_all, k_reverse_all, rxn_network_all, initial_conc, states
+        k_forward_all, k_reverse_all, rxn_network_all, initial_conc, list(states)
     )
 
     max_step = (t_span[1] - t_span[0]) / 10.0
@@ -137,7 +139,7 @@ def run_mkm_3d(
             print(e)
             if rtol == last_[0] and atol == last_[1]:
                 success = True
-                return np.array([np.NaN] * len(idx_target_all))
+                return np.array([np.nan] * len(idx_target_all))
             continue
 
 
@@ -258,6 +260,26 @@ def main(arguments=None):
             grid_d_fill = grid_d
 
         times_space = np.log10(times_space)
+        n_failed = int(np.isnan(grid_d).any(axis=0).sum())
+        run_record.update(
+            "cond",
+            grid_file="mkm_time_temperature.h5",
+            axes={
+                "temperature_K": [
+                    float(temperatures_space[0]),
+                    float(temperatures_space[-1]),
+                    int(npoints),
+                ],
+                "log10_time_s": [float(times_space[0]), float(times_space[-1]), int(npoints)],
+            },
+            failed_points=n_failed,
+            imputer=imputer_strat,
+        )
+        if n_failed:
+            run_record.warn(
+                f"{n_failed} grid point(s) failed to solve and were filled by the "
+                f"{imputer_strat} imputer"
+            )
         with h5py.File("mkm_time_temperature.h5", "w") as f:
             group = f.create_group("data")
             # save each numpy array as a dataset in the group
@@ -424,6 +446,11 @@ def main(arguments=None):
                 verb=verb,
             )
             outputs.extend(["Temperature (K)_screen.png", "temperature_screen.csv"])
+            run_record.update(
+                "cond",
+                grid_file="temperature_screen.csv",
+                axes={"temperature_K": list(temperatures)},
+            )
 
         elif len(temperatures) == 1:
             if verb > 0:
@@ -478,6 +505,7 @@ def main(arguments=None):
                 t_finals, final_prod_concs.T, "Time [s]", prod_name, verb=verb
             )
             outputs.extend(["Time [s]_screen.png", "time_screen.csv"])
+            run_record.update("cond", grid_file="time_screen.csv", axes={"time_s": list(t_finals)})
 
         elif len(t_finals) > 1 and len(temperatures) > 1:
             if verb > 0:
@@ -541,6 +569,11 @@ def main(arguments=None):
             if verb > 0:
                 print(df.to_string(index=False))
             outputs.append("time_temperature_screen.csv")
+            run_record.update(
+                "cond",
+                grid_file="time_temperature_screen.csv",
+                axes={"time_s": list(t_finals), "temperature_K": list(temperatures)},
+            )
 
         _print_output_summary(outputs, verb)
 

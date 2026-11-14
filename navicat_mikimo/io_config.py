@@ -14,7 +14,7 @@ class SharedCLIConfig:
     addition: Optional[List[int]] = None
     int_quality: int = 1
     ncore: int = 1
-    imputer_strat: str = "knn"
+    imputer_strat: str = "none"
     verb: int = 2
     kinetic_mode: bool = False
 
@@ -30,7 +30,7 @@ class MKMScreeningConfig:
     xbase: float = 20.0
     lmargin: int = 20
     rmargin: int = 20
-    idx: Optional[List[int]] = None
+    idx: Optional[List[Union[int, str]]] = None
     percent: bool = False
     plotmode: int = 1
     confidence_interval: bool = False

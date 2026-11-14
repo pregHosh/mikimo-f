@@ -20,6 +20,28 @@ warnings.filterwarnings("ignore")
 logger = logging.getLogger(__name__)
 
 
+def declared_roles(states, r_idx, p_idx=None):
+    """Reactant (and product) indices after a roles file's declarations.
+
+    The solver takes reactants and products from the species names (R... and P...). A species
+    that a roles file declares (`states.declared_roles`, see helper.species_list) is taken at its
+    declared role instead: reactant; product or target; any other role (intermediate, spectator) is
+    neither. Without a roles file the name rule stands and the indices come back unchanged.
+    """
+    declared = getattr(states, "declared_roles", None) or {}
+    if not declared:
+        return r_idx, p_idx
+    own = {i: declared[str(s).strip()] for i, s in enumerate(states) if i > 0 and str(s).strip() in declared}
+    r = [int(i) for i in r_idx if int(i) not in own] + [i for i, r_ in own.items() if r_ == "reactant"]
+    out_r = sorted(r)
+    if p_idx is None:
+        return out_r, None
+    p = [int(i) for i in p_idx if int(i) not in own] + [
+        i for i, r_ in own.items() if r_ in ("product", "target")
+    ]
+    return out_r, sorted(p)
+
+
 def system_KE_DE(
     k_forward_all: np.ndarray,
     k_reverse_all: np.ndarray,
@@ -43,8 +65,15 @@ def system_KE_DE(
 
     boundary = np.zeros((initial_conc.shape[0], 2))
     TOLERANCE = 1
-    r_idx = np.where(char.startswith(states, "R") & ~char.startswith(states, "INT"))[0]
+    # a starred species is a target product, never a reactant (e.g. "RR-Product*")
+    r_idx = np.where(
+        char.startswith(states, "R")
+        & ~char.startswith(states, "INT")
+        & (char.find(states, "*") < 0)
+    )[0]
     p_idx = np.where(char.startswith(states, "P") & ~char.startswith(states, "INT"))[0]
+    r_idx, p_idx = declared_roles(states, r_idx, p_idx)
+    r_idx, p_idx = np.array(r_idx, dtype=int), np.array(p_idx, dtype=int)
     int_idx = np.setdiff1d(
         np.arange(1, initial_conc.shape[0]), np.concatenate([r_idx, p_idx])
     )
@@ -134,7 +163,13 @@ def calc_km(
     idx_target_all = [states.index(i) for i in states if "*" in i]
 
     if ks is not None:
+        # the compiled solver takes C-contiguous float64 rates and an int32 network
+        ks = np.ascontiguousarray(np.asarray(ks, dtype=np.float64))
         k_forward_all, k_reverse_all = np.split(ks, 2)
+        k_forward_all = np.ascontiguousarray(k_forward_all)
+        k_reverse_all = np.ascontiguousarray(k_reverse_all)
+        rxn_network_all = np.ascontiguousarray(np.asarray(rxn_network_all).astype(np.int32))
+        initial_conc = np.asarray(initial_conc, dtype=np.float64)
     else:
         k_forward_all, k_reverse_all = calc_k(
             energy_profile_all, dgr_all, coeff_TS_all, temperature
@@ -264,7 +299,9 @@ def calc_km(
         result_solve_ivp = _attempt_solve("Radau", 1e-6, 1e-9, "radau_last_resort")
 
     if result_solve_ivp is None:
-        raise RuntimeError("All ODE solver attempts failed. See diagnostics for details.")
+        err = RuntimeError("All ODE solver attempts failed. See diagnostics for details.")
+        err.mikimo_solver_diagnostics = solver_diagnostics
+        raise err
 
     successful_attempts = [
         a for a in solver_diagnostics["attempts"] if a.get("status") == "success"
@@ -284,8 +321,9 @@ def calc_km(
         r_idx = [
             i
             for i, s in enumerate(states)
-            if s.lower().startswith("r") and "INT" not in s
+            if s.lower().startswith("r") and "INT" not in s and "*" not in s
         ]
+        r_idx = declared_roles(states, r_idx)[0]
         reactant_nx = rxn_network_all[:, r_idx]
         reactant_nx_2 = []
         for col in range(reactant_nx.shape[1]):
@@ -308,7 +346,7 @@ def calc_km(
             return c_target_t, result_solve_ivp
 
     except Exception:
-        return np.array([np.NaN] * len(idx_target_all)), result_solve_ivp
+        return np.array([np.nan] * len(idx_target_all)), result_solve_ivp
 
 
 def test_get_k():
@@ -685,7 +723,8 @@ def _run_simulation_with_kinetic_profile(
     ks,
 ):
     initial_conc, df_network = _extract_initial_concentrations(df_network)
-    rxn_network_all = df_network.to_numpy()[:, :]
+    initial_conc = np.asarray(initial_conc, dtype=np.float64)
+    rxn_network_all = np.ascontiguousarray(df_network.to_numpy().astype(np.int32))
     ks_actual = 10 ** ks
     _, result_solve_ivp = calc_km(
         None,
@@ -734,7 +773,49 @@ def _run_simulation_with_energy_profile(
     return initial_conc, result_solve_ivp
 
 
+def _max_conc(initial_conc, rxn_network_all, idx):
+    """Most of species `idx` (M) the steps can make from the initial concentrations, for the
+    yields in mikimo_result.json, and why it is None when there is no finite maximum.
+
+    A linear program over the step extents x (either direction, as every step is reversible):
+    maximise c0[idx] + (S x)[idx] with c0 + S x >= 0 for every species. Any state the
+    simulation reaches satisfies these constraints, so a yield against this is at most 100%.
+    It handles branches, a ligand released and bound again, and precatalyst activation, which a
+    single limiting-reactant rule miscounts. calc_km's own clip for `-p` is unchanged.
+    """
+    from scipy.optimize import linprog
+
+    S = np.asarray(rxn_network_all, dtype=float).T  # species x steps
+    c0 = np.asarray(initial_conc, dtype=float)
+    if not (np.all(np.isfinite(S)) and np.all(np.isfinite(c0))):
+        return None, "the network or the initial concentrations are not all finite"
+    res = linprog(
+        -S[idx], A_ub=-S, b_ub=c0, bounds=[(None, None)] * S.shape[1], method="highs"
+    )
+    if res.status == 3:
+        return None, "the steps can make it without consuming any tracked species (unbalanced steps)"
+    if res.status != 0:
+        return None, f"no maximum found ({res.message})"
+    best = float(c0[idx] + S[idx] @ res.x)
+    if not (best > 0 and np.isfinite(best)):
+        return None, "the steps cannot make it from the initial concentrations"
+    return best, None
+
+
+def _write_timecourse(result_solve_ivp, states, filename="mkm_timecourse.csv"):
+    import pandas as pd
+
+    data = {"time_s": result_solve_ivp.t}
+    for i, s in enumerate(states):
+        data[str(s)] = result_solve_ivp.y[i]
+    pd.DataFrame(data).to_csv(filename, index=False)
+    return filename
+
+
 def main(arguments=None):
+    from . import run_record
+    from .helper import record_species
+
     cli_args = sys.argv[2:] if arguments is None else arguments
     quiet = ("--quiet" in cli_args) or ("-q" in cli_args)
     (
@@ -751,27 +832,73 @@ def main(arguments=None):
     ) = preprocess_data_mkm(cli_args, mode="mkm_solo")
 
     t_span = (0, t_final)
-    if ks is not None:
-        initial_conc, result_solve_ivp = _run_simulation_with_kinetic_profile(
-            df_network=df_network,
-            states=states,
-            temperature=temperature,
-            t_span=t_span,
-            quality=quality,
-            ks=ks,
+    try:
+        if ks is not None:
+            initial_conc, result_solve_ivp = _run_simulation_with_kinetic_profile(
+                df_network=df_network,
+                states=states,
+                temperature=temperature,
+                t_span=t_span,
+                quality=quality,
+                ks=ks,
+            )
+        else:
+            initial_conc, result_solve_ivp = _run_simulation_with_energy_profile(
+                dg=dg,
+                df_network=df_network,
+                tags=tags,
+                states=states,
+                temperature=temperature,
+                t_span=t_span,
+            )
+    except RuntimeError as e:
+        diag = getattr(e, "mikimo_solver_diagnostics", {})
+        run_record.update(
+            "mkm",
+            solver={
+                "method": None,
+                "success": False,
+                "fallbacks": diag.get("fallback_used"),
+                "attempts": diag.get("attempts"),
+            },
         )
-    else:
-        initial_conc, result_solve_ivp = _run_simulation_with_energy_profile(
-            dg=dg,
-            df_network=df_network,
-            tags=tags,
-            states=states,
-            temperature=temperature,
-            t_span=t_span,
-        )
+        run_record.set_status("failed", f"MKM solve failed: {e}")
+        sys.exit(f"MKM solve failed: {e}")
 
     states_ = [s.replace("*", "") for s in states]
     plot_evo_save(result_solve_ivp, None, states_, x_scale, more_species_mkm)
+
+    y_final = result_solve_ivp.y[:, -1]
+    diag = getattr(result_solve_ivp, "mikimo_solver_diagnostics", {})
+    solved = bool(result_solve_ivp.success) and bool(np.all(np.isfinite(y_final)))
+    record_species(df_network, states, c_final=y_final)
+    _, network_steps_only = _extract_initial_concentrations(df_network)
+    steps_nx = network_steps_only.to_numpy().astype(float)
+    targets = {}
+    for i, s in enumerate(states):
+        if "*" in s:
+            c = float(y_final[i])
+            best, why = _max_conc(initial_conc, steps_nx, i)
+            if best is None:
+                run_record.warn(f"yield_pct of {s} is null: {why}")
+            targets[s.replace("*", "").strip()] = {
+                "conc_M": c,
+                "yield_pct": None if best is None else c / best * 100,
+                "yield_reference_M": best,
+            }
+    run_record.update(
+        "mkm",
+        targets=targets,
+        solver={
+            "method": diag.get("selected_method"),
+            "success": solved,
+            "ivp_success": bool(result_solve_ivp.success),
+            "message": str(result_solve_ivp.message),
+            "fallbacks": diag.get("fallback_used"),
+            "attempts": diag.get("attempts"),
+        },
+        timecourse_csv=_write_timecourse(result_solve_ivp, states),
+    )
 
     if not quiet:
         print(section("Reactant Initial Concentration"))
@@ -788,6 +915,16 @@ def main(arguments=None):
         p_indices = [i for i, s in enumerate(states) if s.lower().startswith("p")]
         for i in p_indices:
             print(concentration_line(states[i], result_solve_ivp.y[i][-1]))
+
+    if not solved:
+        bad = [str(states[i]) for i in range(len(states)) if not np.isfinite(y_final[i])]
+        why = (
+            f"non-finite final concentrations for {bad}"
+            if bad
+            else f"solver reported failure ({result_solve_ivp.message})"
+        )
+        run_record.set_status("failed", f"MKM solve failed: {why}")
+        sys.exit(f"MKM solve failed: {why}. See mikimo_result.json.")
 
 
 if __name__ == "__main__":

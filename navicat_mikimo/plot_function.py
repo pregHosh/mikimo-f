@@ -6,7 +6,13 @@ import pandas as pd
 from matplotlib import cm
 from matplotlib.ticker import FuncFormatter
 from navicat_volcanic.helpers import bround
-from navicat_volcanic.plotting2d import beautify_ax
+from navicat_volcanic.plotting2d import beautify_ax, plot_ci, plotpoints
+
+
+def _get_cmap(name, lut=None):
+    """A colormap resampled to `lut` colours (the matplotlib.cm lookup function was removed in 3.9)."""
+    cmap = matplotlib.colormaps[name]
+    return cmap if lut is None else cmap.resampled(lut)
 
 matplotlib.use("Agg")
 
@@ -341,40 +347,6 @@ def plot_save_cond(x, Pfs, var, prod_name, verb=1):
         print(df.to_string(index=False))
 
 
-def plot_ci(ci, x2, y2, ax=None):
-    """taken from navicat_volcanic"""
-    if ax is None:
-        try:
-            ax = plt.gca()
-        except Exception as m:
-            return
-
-    ax.fill_between(x2, y2 + ci, y2 - ci, color="#b9cfe7", alpha=0.6)
-
-    return
-
-
-def plotpoints(ax, px, py, cb, ms, plotmode):
-    """adapted from navicat_volcanic"""
-    if plotmode == 1:
-        s = 30
-        lw = 0.3
-    else:
-        s = 15
-        lw = 0.25
-    for i in range(len(px)):
-        ax.scatter(
-            px[i],
-            py[i],
-            s=s,
-            c=cb[i],
-            marker=ms[i],
-            linewidths=lw,
-            edgecolors="black",
-            zorder=2,
-        )
-
-
 def plot_2d_combo(
     x,
     y,
@@ -514,7 +486,7 @@ def plot_3d_m(
     levels = np.arange(ymin, ymax + increment, increment / 100)
 
     cset = ax.contourf(
-        xint, yint, grid, levels=levels, norm=norm, cmap=cm.get_cmap(cmap, len(levels))
+        xint, yint, grid, levels=levels, norm=norm, cmap=_get_cmap(cmap, len(levels))
     )
 
     # Labels and key
@@ -585,7 +557,7 @@ def plot_3d_np(
     levels = np.arange(ymin, ymax + increment, increment / 100)
 
     cset = ax.contourf(
-        xint, yint, grid, levels=levels, norm=norm, cmap=cm.get_cmap(cmap, len(levels))
+        xint, yint, grid, levels=levels, norm=norm, cmap=_get_cmap(cmap, len(levels))
     )
 
     xticks = np.arange(x1min, x1max + increment, x1base)
@@ -637,7 +609,7 @@ def plot_3d_contour_regions_np(
     ax = beautify_ax(ax)
     levels = np.arange(-0.1, nunique + 0.9, 1)
     cset = ax.contourf(
-        xint, yint, grid, levels=levels, cmap=cm.get_cmap("Dark2", nunique + 1)
+        xint, yint, grid, levels=levels, cmap=_get_cmap("Dark2", nunique + 1)
     )
 
     # Labels and key

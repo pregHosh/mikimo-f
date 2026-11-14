@@ -11,10 +11,7 @@ import numpy as np
 import pandas as pd
 import sklearn as sk
 from joblib import Parallel, delayed
-from navicat_volcanic.dv1 import curate_d
-from navicat_volcanic.dv2 import dv_collinear, find_2_dv
-from navicat_volcanic.helpers import (bround, group_data_points,
-                                      user_choose_1_dv, user_choose_2_dv)
+from navicat_volcanic.helpers import bround, group_data_points
 from navicat_volcanic.plotting2d import (calc_ci, get_reg_targets, plot_2d,
                                          plot_2d_lsfer)
 from navicat_volcanic.plotting3d import (get_bases, plot_3d_contour,
@@ -22,232 +19,14 @@ from navicat_volcanic.plotting3d import (get_bases, plot_3d_contour,
 from scipy.interpolate import interp1d
 from tqdm import tqdm
 
-from .helper import call_imputter
+from . import run_record
+from .helper import (call_imputter, choose_descriptors, column_masks,
+                     curate_profiles, energy_columns)
 from .kinetic_solver_runner import calc_km
 from .plot_function import (plot_2d_combo, plot_3d_contour_regions_np,
                             plot_3d_m, plot_3d_np, plot_evo)
 
 warnings.filterwarnings("ignore")
-
-
-def find_1_dv(d, tags, coeff, regress, verb=0):
-    """ "Modified from the volcanic version to work with the kinetic profile"""
-    assert isinstance(d, np.ndarray)
-    assert len(tags) == len(coeff) == len(regress)
-    tags = tags[:]
-    coeff = coeff[:]
-    regress = regress[:]
-    d = d[:, :]
-    lnsteps = range(d.shape[1])
-    regsteps = range(d[:, regress].shape[1])
-    # Regression diagnostics
-    maes = np.ones(d.shape[1])
-    r2s = np.ones(d.shape[1])
-    maps = np.ones(d.shape[1])
-    for i in lnsteps:
-        if verb > 0:
-            print(f"\nTrying {tags[i]} as descriptor variable:")
-        imaes = []
-        imaps = []
-        ir2s = []
-        for j in regsteps:
-            Y = d[:, regress][:, j]
-            XY = np.vstack([d[:, i], d[:, j]]).T
-            XY = XY[~np.isnan(XY).any(axis=1)]
-            X = XY[:, 0].reshape(-1, 1)
-            Y = XY[:, 1]
-            reg = sk.linear_model.LinearRegression().fit(X, Y)
-            imaes.append(sk.metrics.mean_absolute_error(Y, reg.predict(X)))
-            imaps.append(sk.metrics.mean_absolute_percentage_error(Y, reg.predict(X)))
-            ir2s.append(reg.score(X, Y))
-            if verb > 1:
-                print(
-                    f"With {tags[i]} as descriptor, regressed {tags[j]} with r2 : {np.round(ir2s[-1],2)} and MAE: {np.round(imaes[-1],2)}"
-                )
-        if verb > 2:
-            print(
-                f"\nWith {tags[i]} as descriptor the following r2 values were obtained : {np.round(ir2s,2)}"
-            )
-        maes[i] = np.around(np.array(imaes).mean(), 4)
-        r2s[i] = np.around(np.array(ir2s).mean(), 4)
-        maps[i] = np.around(np.array(imaps).mean(), 4)
-        if verb > 0:
-            print(
-                f"\nWith {tags[i]} as descriptor,\n the mean r2 is : {np.round(r2s[i],2)},\n the mean MAE is :  {np.round(maes[i],2)}\n the std MAPE is : {np.round(maps[i],2)}\n"
-            )
-    criteria = []
-    criteria.append(np.squeeze(np.where(r2s == np.max(r2s[coeff]))))
-    criteria.append(np.squeeze(np.where(maes == np.min(maes[coeff]))))
-    criteria.append(np.squeeze(np.where(maps == np.min(maps[coeff]))))
-    for i, criterion in enumerate(criteria):
-        if isinstance(criterion, (np.ndarray)):
-            if any(criterion.shape):
-                criterion = [idx for idx in criterion if coeff[idx]]
-                criteria[i] = rng.choice(criterion, size=1)
-    a = criteria[0]
-    b = criteria[1]
-    c = criteria[2]
-    dvs = []
-    if a == b:
-        if a == c:
-            if verb >= 0:
-                print(f"All indicators agree: best descriptor is {tags[a]}")
-            dvs.append(a)
-        else:
-            if verb >= 0:
-                print(
-                    f"Disagreement: best descriptors is either \n{tags[a]} or \n{tags[c]}"
-                )
-            dvs = [a, c]
-    elif a == c:
-        if verb >= 0:
-            print(
-                f"Disagreement: best descriptors is either \n{tags[a]} or \n{tags[b]}"
-            )
-        dvs = [a, b]
-    elif b == c:
-        if verb >= 0:
-            print(
-                f"Disagreement: best descriptors is either \n{tags[a]} or \n{tags[b]}"
-            )
-        dvs = [a, b]
-    else:
-        if verb >= 0:
-            print(
-                f"Total disagreement: best descriptors is either \n{tags[a]} or \n{tags[b]} or \n{tags[c]}"
-            )
-        dvs = [a, b, c]
-    r2 = [r2s[i] for i in dvs]
-    dvs = [i for i in dvs]  # Recover the removed step of the reaction
-    return dvs, r2
-
-
-def find_2_dv(d, tags, coeff, regress, verb=0):
-    assert isinstance(d, np.ndarray)
-    assert len(tags) == len(coeff)
-    if np.isclose(d[:, -1].std(), 0):
-        regress[-1] = False
-        if verb > 0:
-            print(f"\nReaction energy is constant. Assuming substrates are constant.")
-    tags = tags[:]
-    coeff = coeff[:]
-    regress = regress[:]
-    d = d[:, :]
-    lnsteps = range(d.shape[1])
-    regsteps = range(d[:, regress].shape[1])
-    pnsteps = itertools.combinations(lnsteps, r=2)
-    lpnsteps = [pair for pair in pnsteps]
-    pn = len(lpnsteps)
-    pcoeff = np.zeros(pn)
-    ptags = np.empty(pn, dtype=object)
-    for i, pair in enumerate(lpnsteps):
-        if coeff[pair[0]] or coeff[pair[1]]:
-            pcoeff[i] = 1
-        ptags[i] = tags[pair[0]] + " and " + tags[pair[1]]
-    # Regression diagnostics
-    maes = np.ones(pn)
-    r2s = np.ones(pn)
-    maps = np.ones(pn)
-    for idx, ij in enumerate(lpnsteps):
-        i = ij[0]
-        j = ij[1]
-        if verb > 0:
-            print(
-                f"\nTrying combination of {tags[i]} and {tags[j]} as descriptor variable:"
-            )
-        imaes = []
-        imaps = []
-        ir2s = []
-        for k in regsteps:
-            Y = d[:, regress][:, k]
-            XY = np.vstack([[d[:, i], d[:, j]], d[:, k]]).T
-            XY = XY[~np.isnan(XY).any(axis=1)]
-            X = XY[:, :2]
-            if dv_collinear(X, verb):
-                maes[idx] = np.nan
-                r2s[idx] = 0
-                maps[idx] = np.nan
-                break
-            Y = XY[:, 2]
-            # Fitting using scikit-learn LinearModel
-            reg = sk.linear_model.LinearRegression().fit(X, Y)
-            imaes.append(sk.metrics.mean_absolute_error(Y, reg.predict(X)))
-            imaps.append(sk.metrics.mean_absolute_percentage_error(Y, reg.predict(X)))
-            ir2s.append(reg.score(X, Y))
-            if verb > 1:
-                print(
-                    f"With a combination of {tags[i]} and {tags[j]} as descriptor, regressed {tags[k]} with r2 : {np.round(ir2s[-1],2)} and MAE: {np.round(imaes[-1],2)}"
-                )
-
-            if verb > 2:
-                print(
-                    f"Linear model has coefficients : {reg.coef_} \n and intercept {reg.intercept_}"
-                )
-        if verb > 2:
-            print(
-                f"\nWith a combination of {tags[i]} and {tags[j]} as descriptor the following r2 values were obtained : {np.round(ir2s,2)}"
-            )
-        maes[idx] = np.around(np.array(imaes).mean(), 4)
-        r2s[idx] = np.around(np.array(ir2s).mean(), 4)
-        maps[idx] = np.around(np.array(imaps).std(), 4)
-        if verb > 0:
-            print(
-                f"\nWith a combination of {tags[i]} and {tags[j]} as descriptor,\n the mean r2 is : {np.round(r2s[idx],2)},\n the mean MAE is :  {np.round(maes[idx],2)}\n the std MAPE is : {np.round(maps[idx],2)}\n"
-            )
-    criteria = []
-    criteria.append(
-        np.squeeze(np.where(r2s == np.nanmax(r2s[np.ma.make_mask(pcoeff)])))
-    )
-    criteria.append(
-        np.squeeze(np.where(maes == np.nanmin(maes[np.ma.make_mask(pcoeff)])))
-    )
-    criteria.append(
-        np.squeeze(np.where(maps == np.nanmin(maps[np.ma.make_mask(pcoeff)])))
-    )
-    for i, criterion in enumerate(criteria):
-        if isinstance(criterion, (np.ndarray)):
-            if any(criterion.shape):
-                if verb > 2:
-                    print(f"A random choice has been made to break a score tie.")
-                criterion = [idx for idx in criterion if np.ma.make_mask(pcoeff)[idx]]
-                criteria[i] = rng.choice(criterion, size=1)
-    a = int(criteria[0])
-    b = int(criteria[1])
-    c = int(criteria[2])
-    if a == b:
-        if a == c:
-            if verb >= 0:
-                print(
-                    f"All indicators agree: best descriptor is the combination {ptags[a]}"
-                )
-            dvs = [a]
-        else:
-            if verb >= 0:
-                print(
-                    f"Disagreement: best descriptors is either the combination \n{ptags[a]} or \n{ptags[c]}"
-                )
-            dvs = [a, c]
-    elif a == c:
-        if verb >= 0:
-            print(
-                f"Disagreement: best descriptors is either the combination \n{ptags[a]} or \n{ptags[b]}"
-            )
-        dvs = [a, b]
-    elif b == c:
-        if verb >= 0:
-            print(
-                f"Disagreement: best descriptors is either the combination \n{ptags[a]} or \n{ptags[b]}"
-            )
-        dvs = [a, b]
-    else:
-        if verb >= 0:
-            print(
-                f"Total disagreement: best descriptors is either the combination \n{ptags[a]} or \n{ptags[b]} or \n{ptags[c]}"
-            )
-        dvs = [a, b, c]
-    r2 = [r2s[i] for i in dvs]
-    dvs = [lpnsteps[i] for i in dvs]
-    return dvs, r2
 
 
 def process_n_calc_2d(
@@ -469,7 +248,10 @@ def evol_mode(
             df_network = df_network.drop(df_network.index[-1])
     rxn_network_all = df_network.to_numpy()[:, :]
 
+    per_profile = []
+    prod_names = [i.replace("*", "") for i in states if "*" in i]
     for i, profile in enumerate(tqdm(d, total=len(d), ncols=80)):
+        status, error = "ok", None
         try:
             result, result_solve_ivp = calc_km(
                 None,
@@ -486,8 +268,16 @@ def evol_mode(
             )
             if len(result) != n_target:
                 prod_conc_pt.append(np.array([np.nan] * n_target))
+                status, error = "failed", f"{len(result)} target values for {n_target} targets"
             else:
                 prod_conc_pt.append(result)
+                if not (result_solve_ivp.success and np.all(np.isfinite(result))):
+                    status = "failed"
+                    error = (
+                        f"non-finite target concentrations ({result_solve_ivp.message})"
+                        if not np.all(np.isfinite(result))
+                        else f"solver reported failure ({result_solve_ivp.message})"
+                    )
 
             result_solve_ivp_all.append(result_solve_ivp)
 
@@ -495,10 +285,28 @@ def evol_mode(
             plot_evo(result_solve_ivp, names[i], states_, x_scale, more_species_mkm)
 
         except Exception as e:
-            print(f"Cannot perform mkm for {names[i]}.")
-            prod_conc_pt.append(np.array([np.nan] * n_target))
-            result_solve_ivp_all.append("Shiki")
+            if len(prod_conc_pt) == i:
+                prod_conc_pt.append(np.array([np.nan] * n_target))
+                result_solve_ivp_all.append(None)
+            status, error = "failed", repr(e)
+        if status != "ok":
+            print(f"Cannot perform mkm for {names[i]}: {error}")
+        per_profile.append(
+            {
+                "id": str(names[i]),
+                "x": None,
+                "target_conc": dict(zip(prod_names, prod_conc_pt[i])),
+                "status": status,
+                "error": error,
+            }
+        )
 
+    run_record.update("vp", per_profile=per_profile)
+    if any(p["status"] != "ok" for p in per_profile):
+        run_record.set_status("partial")
+        run_record.warn(
+            f"MKM failed for {[p['id'] for p in per_profile if p['status'] != 'ok']}"
+        )
     prod_conc_pt = np.array(prod_conc_pt).T
     if verb > 1:
         prod_names = [i.replace("*", "") for i in states if "*" in i]
@@ -561,24 +369,17 @@ def get_srps_1d(
         - idx (int): Index of chosen descriptor.
     """
 
-    dvs, r2s = find_1_dv(d, tags, coeff, regress, verb)
-
-    if lfesrs_idx:
-        idx = lfesrs_idx[0]
-        if verb > 1:
-            print(f"\n**Manually chose {tags[idx]} as a descriptor variable**\n")
-    else:
-        idx = user_choose_1_dv(dvs, r2s, tags)  # choosing descp
-        if idx is None:
-            sys.exit("No descriptor is suitable for the user. Exiting.")
+    idx = choose_descriptors(
+        1, d, tags, coeff, regress, lfesrs_idx, offset=1, units="log10 k", verb=verb
+    )["idx"]
 
     if lfesr:
         plot_2d_lsfer(
             idx,
-            np.insert(d, 0, 0, axis=1),
-            np.insert(tags, 0, "null"),
-            np.insert(coeff, 0, 0),
-            np.insert(regress, 0, False),
+            d,
+            tags,
+            coeff,
+            regress,
             cb,
             ms,
             lmargin,
@@ -666,19 +467,9 @@ def get_srps_2d(
     """
     from navicat_volcanic.plotting3d import bround, get_reg_targets
 
-    dvs, r2s = find_2_dv(d, tags, coeff, regress, verb)
-    if lfesrs_idx:
-        assert len(lfesrs_idx) == 2
-        "Require 2 lfesrs_idx for activity/seclectivity map"
-        idx1, idx2 = lfesrs_idx
-        if verb > 1:
-            print(f"\n**Manually chose {tags[idx1]} and {tags[idx2]} as descriptor**\n")
-    else:
-        idx1, idx2 = user_choose_2_dv(dvs, r2s, np.insert(tags, 0, 0))
-        idx1 -= 1
-        idx2 -= 1
-        if idx1 is None or idx2 is None:
-            sys.exit("No descriptors are suitable for the user. Exiting.")
+    idx1, idx2 = choose_descriptors(
+        2, d, tags, coeff, regress, lfesrs_idx, offset=1, units="log10 k", verb=verb
+    )["idx"]
     X1, X2, tag1, tag2, tags, d, d2, coeff = get_reg_targets(
         idx1, idx2, d, tags, coeff, regress, mode="k"
     )
@@ -716,7 +507,7 @@ def get_srps_2d(
         x1max,
         x2max,
         x1min,
-        x2max,
+        x2min,
         tag1,
         tag2,
         tags,
@@ -805,34 +596,46 @@ def main(
 
     names = df[df.columns[0]].values
     cb, ms = group_data_points(0, 2, names)
-    tags = np.array([str(tag) for tag in df.columns[1:]], dtype=object)
-    d = np.float32(df.to_numpy()[:, 1:])
+    # Rate constants are log10 k, read by name (kf_i / k_i forward, kr_i / k_-i reverse, i = network
+    # step) by the reaction_profile/v1 check. They are put in step order, forward then reverse, before
+    # any other column (a Descriptor column is never a rate constant).
+    kin = df.attrs["kinetic"]
+    rate_cols = list(kin["forward"]) + list(kin["reverse"])
+    order = rate_cols + [c for c in df.columns[1:] if c not in rate_cols]
+    if list(df.columns[1:]) != order and verb > 0:
+        print("Rate-constant columns put in step order (forward, then reverse); other columns after them.")
+    n_rate = len(rate_cols)
+    tags, roles = energy_columns(order, states)
+    d = df[order].to_numpy().astype(np.float64)
+    # volcanic's descriptor search takes the reference state as the first column. A kinetic table has
+    # none, so a zero placeholder column leads, and a descriptor index (-id) counts the table's own columns.
+    tags = np.insert(tags, 0, "reference")
+    roles = ["REFERENCE"] + roles
+    d = np.insert(d, 0, 0.0, axis=1)
+    coeff, regress = column_masks(roles)
+    if verb > 0:
+        for tag, role in zip(tags[1:], roles[1:]):
+            print(f"Assuming field {tag} is {role} (rate constants are log10 k).")
 
-    coeff = np.zeros(len(tags), dtype=bool)
-    regress = np.zeros(len(tags), dtype=bool)
-
-    for i, tag in enumerate(tags):
-        if "k" in tag.lower():
-            if verb > 0:
-                print(f"Assuming field {tag} corresponds to a rate constant.")
-            coeff[i] = True
-            regress[i] = True
-        elif "DESCRIPTOR" in tag.upper():
-            if verb > 0:
-                print(
-                    f"Assuming field {tag} corresponds to a non-energy descriptor variable."
-                )
-            start_des = tag.upper().find("DESCRIPTOR")
-            tags[i] = "".join(
-                [i for i in tag[:start_des]] + [i for i in tag[start_des + 10 :]]
-            )
-            coeff[i] = False
-            regress[i] = False
-
-    d, cb, ms = curate_d(d, regress, cb, ms, tags, imputer_strat, nstds=3, verb=verb)
+    d, cb, ms, names, rows = curate_profiles(
+        d, regress, cb, ms, tags, names, imputer_strat, nstds=3, verb=verb
+    )
+    run_record.update(
+        "vp",
+        nd=nd,
+        rows={k: rows[k] for k in ("n_in", "n_used", "dropped")},
+        imputer=imputer_strat,
+        imputed_cells=rows["imputed_cells"],
+        descriptor=None,
+        grid_file=None,
+        target_units="% yield" if report_as_yield else "M",
+        kinetic_columns={"forward": [str(c) for c in kin["forward"]],
+                         "reverse": [str(c) for c in kin["reverse"]],
+                         "descriptors": [str(c) for c in kin.get("descriptors", [])]},
+    )
     # %% selecting modes----------------------------------------------------------#
     if nd == 0:
-        d_actual = 10**d
+        d_actual = 10 ** d[:, 1 : 1 + n_rate]
         evol_mode(
             d_actual,
             df_network,
@@ -865,18 +668,14 @@ def main(
             verb,
         )
 
-        # For some reason, sometimes the volcanic drops the last state
-        # Kinda adhoc fix for now
-        tags_ = np.array([str(t) for t in df.columns[1:]], dtype=object)
-        if tags_[-1] not in tags and tags_[-1].lower().startswith("p"):
-            # print("\n***Forgot the last state******\n")
-            d_ = np.float32(df.to_numpy()[:, 1:])
-
-            dgs = np.column_stack((dgs, np.full((npoints, 1), d_[-1, -1])))
-            d = np.column_stack((d, np.full((d.shape[0], 1), d_[-1, -1])))
-            tags = np.append(tags, tags_[-1])
-            sigma_dgs = np.column_stack((sigma_dgs, np.full((npoints, 1), 0)))
-
+        run_record.update(
+            "vp",
+            per_profile=[
+                {"id": str(names[i]), "x": float(X[i]), "target_conc": None, "status": None, "error": None}
+                for i in range(len(X))
+            ],
+            grid_file="mkm_descr_phys.h5" if screen_cond else ("mkm_vp.h5" if verb > 1 else None),
+        )
         initial_conc = np.array([])
         last_row_index = df_network.index[-1]
         if isinstance(last_row_index, str):
@@ -930,7 +729,7 @@ def main(
             if np.any(np.isnan(grid_d)):
                 grid_d_fill = np.zeros_like(grid_d)
                 for i, gridi in enumerate(grid_d):
-                    impuuter = call_imputer(imputer_strat)
+                    impuuter = call_imputter(imputer_strat)
                     impuuter.fit(gridi)
                     filled_data = impuuter.transform(gridi)
                     grid_d_fill[i] = filled_data
@@ -940,7 +739,7 @@ def main(
             x1base = np.round((xint.max() - xint.min()) / 10)
             if x1base == 0:
                 x1base = 1
-            x1label = f"log$_{10}$(tag)"
+            x1label = "log$_{10}$" + f"({tag})"
             t_points = np.log10(t_points)
             x2label = "log$_{10}$(time) [s]"
             x2base = np.round((t_points[-1] - t_points[0]) / 10, 1)
@@ -1154,7 +953,7 @@ def main(
                     for profile in batch_dgs
                 )
                 for j, res in enumerate(results):
-                    prod_conc_pt[i, :] = res[0]
+                    prod_conc_pt[i, :] = res
                     i += 1
 
             # interpolation
@@ -1176,7 +975,7 @@ def main(
             prod_conc_pt_ = prod_conc_pt_.T
 
             # Plotting
-            xlabel = f"log$_{10}$(tag)"
+            xlabel = "log$_{10}$" + f"({tag})"
             ylabel = "Final product concentraion (M)"
 
             if report_as_yield:
@@ -1281,7 +1080,7 @@ def main(
             x1max,
             x2max,
             x1min,
-            x2max,
+            x2min,
             tag1,
             tag2,
             tags,
@@ -1291,13 +1090,6 @@ def main(
         ) = get_srps_2d(
             d, tags, coeff, regress, lfesrs_idx, lmargin, rmargin, npoints, verb
         )
-        tags_ = np.array([str(tag) for tag in df.columns[1:]], dtype=object)
-        if len(grids) != len(tags_) and tags_[-1].lower().startswith("p"):
-            print("\n***Forgot the last state******\n")
-            d_ = np.float32(df.to_numpy()[:, 1:])
-
-            grids.append(np.full(((npoints, npoints)), d_[-1, -1]))
-            tags = np.append(tags, tags_[-1])
         if verb > 0:
             print(
                 "\n------------Constructing MKM activity/selectivity map------------------\n"
@@ -1307,7 +1099,7 @@ def main(
         total_combinations = len(xint) * len(yint)
         combinations = list(itertools.product(range(len(xint)), range(len(yint))))
         num_chunks = total_combinations // ncore + (total_combinations % ncore > 0)
-        grids = [g**10 for g in grids]
+        grids = [10**g for g in grids]
 
         initial_conc = np.array([])
         last_row_index = df_network.index[-1]
@@ -1360,8 +1152,18 @@ def main(
             py[i] = X2[i]
 
         # Plotting and saving
-        cb = np.array(cb, dtype="S")
-        ms = np.array(ms, dtype="S")
+        # bytes copies for the HDF5 files; the plots need the colour/marker strings
+        cb_h5 = np.array(cb, dtype="S")
+        ms_h5 = np.array(ms, dtype="S")
+        run_record.update(
+            "vp",
+            grid_file="mkm_vp_3d.h5",
+            per_profile=[
+                {"id": str(names[i]), "x": [float(px[i]), float(py[i])], "target_conc": None,
+                 "status": None, "error": None}
+                for i in range(len(px))
+            ],
+        )
         with h5py.File("mkm_vp_3d.h5", "w") as f:
             group = f.create_group("data")
             # save each numpy array as a dataset in the group
@@ -1370,16 +1172,16 @@ def main(
             group.create_dataset("grids", data=grid_d_fill)
             group.create_dataset("px", data=px)
             group.create_dataset("py", data=py)
-            group.create_dataset("cb", data=cb)
-            group.create_dataset("ms", data=ms)
+            group.create_dataset("cb", data=cb_h5)
+            group.create_dataset("ms", data=ms_h5)
             group.create_dataset("tag1", data=[tag1.encode()])
             group.create_dataset("tag2", data=[tag2.encode()])
 
-        x1label = f"{tag1} [kcal/mol]"
-        x2label = f"{tag2} [kcal/mol]"
+        x1label = "log$_{10}$" + f"({tag1})"
+        x2label = "log$_{10}$" + f"({tag2})"
         x1base = np.round((x1max - x1min) / 10, 1)
-        if x2base == 0:
-            x2base = 0.5
+        if x1base == 0:
+            x1base = 0.5
         x2base = np.round((x2max - x2min) / 10, 1)
         if x2base == 0:
             x2base = 0.5
@@ -1420,8 +1222,8 @@ def main(
                 group.create_dataset("agrid", data=activity_grid)
                 group.create_dataset("px", data=px)
                 group.create_dataset("py", data=py)
-                group.create_dataset("cb", data=cb)
-                group.create_dataset("ms", data=ms)
+                group.create_dataset("cb", data=cb_h5)
+                group.create_dataset("ms", data=ms_h5)
                 group.create_dataset("tag1", data=[tag1.encode()])
                 group.create_dataset("tag2", data=[tag2.encode()])
                 group.create_dataset("x1label", data=[x1label.encode()])
@@ -1451,8 +1253,8 @@ def main(
                     group.create_dataset("sgrid", data=selectivity_ratio_)
                     group.create_dataset("px", data=px)
                     group.create_dataset("py", data=py)
-                    group.create_dataset("cb", data=cb)
-                    group.create_dataset("ms", data=ms)
+                    group.create_dataset("cb", data=cb_h5)
+                    group.create_dataset("ms", data=ms_h5)
                     group.create_dataset("tag1", data=[tag1.encode()])
                     group.create_dataset("tag2", data=[tag2.encode()])
                     group.create_dataset("x1label", data=[x1label.encode()])
@@ -1494,8 +1296,8 @@ def main(
                     group.create_dataset("dominant_indices", data=dominant_indices)
                     group.create_dataset("px", data=px)
                     group.create_dataset("py", data=py)
-                    group.create_dataset("cb", data=cb)
-                    group.create_dataset("ms", data=ms)
+                    group.create_dataset("cb", data=cb_h5)
+                    group.create_dataset("ms", data=ms_h5)
                     group.create_dataset("tag1", data=[tag1.encode()])
                     group.create_dataset("tag2", data=[tag2.encode()])
                     group.create_dataset("x1label", data=[x1label.encode()])

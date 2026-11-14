@@ -1,16 +1,18 @@
+# Same run as the README quickstart: navicat_mikimo mkm -d test_cases/test_1 -t 298.15 -Tf 60
+# shared.dir is relative to this file; outdir "." means outputs/mkm/<timestamp> in the working directory.
 mode: mkm
 shared:
-  dir: test_cases/test_1
-  outdir: outputs/mkm
+  dir: ../../test_cases/test_1
+  outdir: .
   quiet: false
   profile_choice: 0
   time: [60]
-  temp: [398.15]
+  temp: [298.15]
   xscale: ls
   addition: null
   int_quality: 1
   ncore: 1
-  imputer_strat: knn
+  imputer_strat: none
   verb: 0
   kinetic_mode: false
 mode_config: {}

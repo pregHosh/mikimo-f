@@ -9,7 +9,13 @@ from scipy.signal import savgol_filter, wiener
 
 from .plot_function import plot_2d_combo
 
-if __name__ == "__main__":
+
+def _as_mode():
+    """True when called as `navicat_mikimo replot ...` (argv[1] is the mode name)."""
+    return len(sys.argv) > 1 and sys.argv[1] == "replot"
+
+
+def main(arguments=None):
     # Input
     parser = argparse.ArgumentParser(
         description="""Replotting with Varied Filtering Method Parameters. Available for 2D volcano plots only.
@@ -37,7 +43,7 @@ Specifically, consider the following guidelines:
         dest="window_length",
         type=int,
         nargs="+",
-        help="The length of the filter window",
+        help="The length of the filter window, one per product (default: 20 for every product)",
     )
     parser.add_argument(
         "-p",
@@ -45,7 +51,7 @@ Specifically, consider the following guidelines:
         dest="polyorder",
         type=int,
         nargs="+",
-        help="The order of the polynomial used to fit the sample, required if using savgol. polyorder must be less than window_length.",
+        help="The order of the polynomial used to fit the sample, one per product, used with savgol. polyorder must be less than window_length. (default: 3 for every product)",
     )
     parser.add_argument(
         "-pm",
@@ -63,7 +69,7 @@ Specifically, consider the following guidelines:
         help="Flag to save a new data. (default: False)",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(sys.argv[2:] if arguments is None and _as_mode() else arguments)
     filename = args.i
     filtering_method = args.filter
     window_length = args.window_length
@@ -100,6 +106,10 @@ Specifically, consider the following guidelines:
     print(
         f"Detect {prod_conc_.shape[0]} profiles in the input, require {prod_conc_.shape[0]} input for polyorder and window_length."
     )
+    if window_length is None:
+        window_length = [20] * prod_conc_.shape[0]
+    if polyorder is None:
+        polyorder = [3] * prod_conc_.shape[0]
     if filtering_method == "savgol":
         assert len(polyorder) == len(
             window_length
@@ -136,7 +146,6 @@ Specifically, consider the following guidelines:
     xbase = np.round((np.max(descr_all) - np.min(descr_all)) / 8)
     if xbase == 0:
         xbase = 5
-    ci_ = np.full(prod_conc_.shape[0], None)
 
     if prod_conc_.shape[0] > 1:
         plot_2d_combo(
@@ -211,3 +220,7 @@ Specifically, consider the following guidelines:
             group.create_dataset("tag", data=[tag.encode()])
             group.create_dataset("xlabel", data=[xlabel.encode()])
             group.create_dataset("ylabel", data=[ylabel.encode()])
+
+
+if __name__ == "__main__":
+    main()
